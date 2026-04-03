@@ -20,14 +20,29 @@ Downstream System (DB / Cache / Analytics)
 
 ## Key Features 
 ### CDC Event Consumption 
+- Supports Debezium-sytle CDC events
+- Compatible with Canal-style payloads (optional normalization layer)
+- Handles insert / update / delete operations 
 
 ### Event Normalization Layer 
+- Unifies different CDC formats into a common internal model 
+- Abstracts envelope structures (before/after, op codes)
 
 ### Idempotent Processing 
+- Ensures safe reprocessing (at-least-once delivery)
+- Uses business keys (e.g., `event_id`, `transaction_id`) for deduplication
 
-### Manual Offset Management 
+### Manual Offset Management
+- Kafka manual acknowledment 
+- Commit offsets only after successful processing  
 
 ### Event-Time Ordering 
+- Preserves ordering using: 
+
+> partition key (e.g., account_id) 
+> event timestamp 
+
+- Handles out-of-order events where applicable 
 
 
 ## Technology Stack 
