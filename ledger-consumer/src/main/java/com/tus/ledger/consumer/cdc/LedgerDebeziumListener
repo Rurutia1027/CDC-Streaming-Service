@@ -1,0 +1,68 @@
+package com.tus.ledger.consumer.cdc;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tus.ledger.consumer.projection.LedgerProjectionApplier;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Component;
+
+/**
+ Debezium-only consumer demonstrating four production practices
+ (1) Partitioning / ordering - ensured upstream by Debezium {@code message.key.columns=...:account_id}.
+  Kafka record key routes all events for one account to the same partition, preserving per-account order.
+
+  (2) Idempotent consumption - {@link LedgerProjectionApplier} dedupes by {@code tx_id}
+
+  (3) Replay - longer retention (see docker-compose) + reset consumer group / new group id to rebuild projections.
+
+  (4) Effective exactly-once - at-least-once delivery + idempotent dedupe + monotonic {@code event_seq} guard;
+  offset is committed only after the projection transaction succeeds.
+*/
+@Component
+public class LedgerDebeziumListener {
+    private final ObjectMapper objectMapper;
+    private final LedgerProjectionApplier projectionApplier;
+
+    public LedgerDebeziumListener(ObjectMapper objectMapper, LedgerProjectionApplier projectionApplier) {
+      this.objectMapper = objectMapper;
+      this.projectionApplier = projectionApplier;
+    }
+
+    @KafkaListener(topics = "${ledger.cdc.topic}")
+    public void onMessage(ConsumerRecord<String, String> record, Acknowledgment acknowledgment) {
+        try {
+            JsonNode root = objectMapper.readTree(record.value());
+            JsonNode payload = root.path("payload");
+            String op = payload.path("op").asText("");
+            if (!"c".equals(op) && !"r".equals(op)) {
+              acknowledgment.acknowledge()
+              return;
+            }
+
+            JsonNode after = payload.path("after");
+            if (after.isMissingNode() || after.isNull()) {
+                acknowledgment.acknowledge();
+                return;
+            }
+
+            String txId = text(after, "tx_id");
+            String accountId = text(after, "account_id");
+            long eventSeq = after.path("event_seq").asLong();
+            long balanceAfter = after.path("balance_after").asLong();
+
+            projectionApplier.applyInsert(txId, accountId, eventSeq, balanceAfter);
+            acknowledgment.acknowledge();
+        } catch (Exception ex) {
+            ex.printStack();
+        }
+    }
+
+     private static String text(JsonNode node, String field) {
+            JsonNode v = node.get(field);
+            return v == null || v.isNull() ? "" : v.asText();
+        }
+}

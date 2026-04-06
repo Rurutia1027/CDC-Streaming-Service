@@ -1,0 +1,8 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3310/ledger_db?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+    username: ${SPRING_DATASOURCE_USERNAME:ledger_app}
+    password: ${SPRING_DATASOURCE_PASSWORD:ledger_app}

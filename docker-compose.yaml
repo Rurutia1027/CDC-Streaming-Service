@@ -1,0 +1,113 @@
+# Ledger CDC demo: MySQL (source of truth) -> Debezium Connect -> Kafka -> Spring consumer (projection + idempotency).
+# Stack oriented for industrial patterns: binlog CDC, partition key = account_id, at-least-once + idempotent sink.
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: ledger-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      TZ: UTC
+    command:
+      - --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3310:3306"
+    volumes:
+      - ./mysql/conf.d:/etc/mysql/conf.d
+      - ./mysql/init:/docker-entrypoint-initdb.d
+      - ledger_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD-SHELL", "mysqladmin ping -h localhost -proot" ]
+      interval: 10s
+      timeout: 5s
+      retries: 25
+    networks:
+      - ledger-net
+
+  kafka:
+    image: apache/kafka:4.0.2
+    container_name: ledger-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    ports:
+      - "9094:9092"
+    networks:
+      - ledger-net
+
+  # Official Debezium image ships MySQL connector plugins (no separate confluent-hub install).
+  connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: ledger-debezium-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8084:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: ledger-connect-cluster
+      CONFIG_STORAGE_TOPIC: ledger_connect_configs
+      OFFSET_STORAGE_TOPIC: ledger_connect_offsets
+      STATUS_STORAGE_TOPIC: ledger_connect_status
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    networks:
+      - ledger-net
+#
+#  ledger-writer:
+#    build: ./ledger-writer-java
+#    container_name: ledger-writer
+#    depends_on:
+#      mysql:
+#        condition: service_healthy
+#    environment:
+#      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/ledger_db?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+#      SPRING_DATASOURCE_USERNAME: ledger_app
+#      SPRING_DATASOURCE_PASSWORD: ledger_app
+#    ports:
+#      - "8090:8080"
+#    networks:
+#      - ledger-net
+#
+#  ledger-consumer:
+#    build: ./ledger-consumer-java
+#    container_name: ledger-consumer
+#    depends_on:
+#      kafka:
+#        condition: service_healthy
+#      mysql:
+#        condition: service_healthy
+#    environment:
+#      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/ledger_db?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+#      SPRING_DATASOURCE_USERNAME: ledger_app
+#      SPRING_DATASOURCE_PASSWORD: ledger_app
+#      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+#      LEDGER_CDC_TOPIC: ledger_finance.ledger_db.ledger_transaction
+#      LEDGER_KAFKA_GROUP_ID: ledger-projection-consumer
+#    networks:
+#      - ledger-net
+
+volumes:
+  ledger_mysql_data:
+
+networks:
+  ledger-net:
+    driver: bridge
