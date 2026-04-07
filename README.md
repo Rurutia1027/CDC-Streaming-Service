@@ -1,45 +1,59 @@
-# Ledger CDC demo (Debezium + Kafka + Spring Boot)
+# Ledger CDC demo (Debezium → Kafka → ClickHouse + MySQL)
 
-Industrial-style reference for **scenario 1 (ledger / balance propagation)** without Canal:
+## Pipeline (default)
 
-- **MySQL** `ledger_db` is the **system of record** (append-only `ledger_transaction` + per-account running row).
-- **Debezium** (Kafka Connect) reads **binlog** and publishes to Kafka.
-- **Partition key** = `account_id` via `message.key.columns` (per-account ordering inside one partition).
-- **Spring consumer** implements **idempotent + monotonic** projection updates and **manual offset commit**.
+```text
+MySQL (ledger)  →  Debezium (Kafka Connect)  →  Kafka topic
+                                              →  ClickHouse Kafka engine + MV  →  MergeTree (analytics.ledger_tx_events)
+                                              →  Spring consumer (MySQL projection, separate group)
+```
+
+**ClickHouse pulls from Kafka** using `ENGINE = Kafka` + `MATERIALIZED VIEW` — see
+`clickhouse/init/02-kafka-engine.sql`.  
+No JDBC app is required for the primary ClickHouse path.
 
 ## Stack (docker-compose)
 
-| Service         | Image                          | Host ports (defaults) |
-|-----------------|--------------------------------|-----------------------|
-| MySQL 8         | `mysql:8.0`                    | `3310` → 3306         |
-| Kafka (KRaft)   | `bitnami/kafka:3.7`            | `9094` → 9092         |
-| Kafka Connect   | `quay.io/debezium/connect:2.7` | `8084` → 8083 (REST)  |
-| Ledger writer   | build `ledger-writer-java`     | `8090` → 8080         |
-| Ledger consumer | build `ledger-consumer-java`   | (no public port)      |
+| Service         | Role                                                  | Host ports                     |
+|-----------------|-------------------------------------------------------|--------------------------------|
+| MySQL           | System of record                                      | `3310` → 3306                  |
+| Kafka (KRaft)   | Broker                                                | `9094` → 9092                  |
+| ClickHouse      | OLAP + Kafka ingest                                   | `8123` (HTTP), `9000` (native) |
+| Kafka Connect   | Debezium                                              | `8084` → 8083                  |
+| ledger-writer   | REST → MySQL                                          | `8090` → 8080                  |
+| ledger-consumer | MySQL projection (group `ledger-projection-consumer`) | —                              |
+
+## Optional: JDBC / Flink / Spark → ClickHouse
+
+Same topic, different consumer groups — **not** the default (to avoid double-writing the same rows).
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.analytics-jdbc.yml up -d --build
+```
+
+- **Spark Structured Streaming** is Java: `spark-ledger-metrics-java/` (image `spark-ledger-streaming`).
+
+## Docs (scenario tree)
+
+- **ClickHouse analytics + tradeoffs vs other warehouses (conceptual)**: [
+  `clickhouse-analytics-scenarios-tree-en.md`](./docs/clickhouse-analytics-scenarios-tree-en.md)
 
 ## Start
 
-```shell
-docker compose up -d --build 
+```bash
+cd deploy/ledger-cdc-kafka-demo
+docker compose up -d --build
 ```
 
-## Register the Debezium MySQL connector
+## Register Debezium connector
 
-After Connect is up, use curl command below register Debezium MySQL connector
-
-```shell
+```bash
 curl -s -X POST http://localhost:8084/connectors \
   -H 'Content-Type: application/json' \
   -d @kafka-connect/connectors/debezium-mysql-ledger.json
 ```
 
-Then check status:
-
-```shell
-curl -s http://localhost:8084/connectors/ledger-mysql-cdc/status | jq .
-```
-
-## Post a ledger line (system of record)
+## Post a ledger line
 
 ```bash
 curl -s -X POST http://localhost:8090/ledger/post \
@@ -47,47 +61,39 @@ curl -s -X POST http://localhost:8090/ledger/post \
   -d '{"accountId":"acc-001","amountCents":500}'
 ```
 
-## Verify projection (eventually consistent read model)
+## Verify ClickHouse (Kafka → CH)
 
 ```bash
-# expected data flow is 
-# first request insert new record to mysql db 
-# then debezium & kafka connector detect that, convert metadata + db record as one event and sync to kafka
-# ledger-consumer side listen to the kafka corresponding topic, subscribe the event and extracted fields save to db in ledger_db
-# and that record cna be fetched via the sql command below (we can also add controller fetch it)  
+docker exec -i ledger-clickhouse clickhouse-client -q \
+  "SELECT source, tx_id, account_id, amount_cents, event_seq, balance_after FROM analytics.ledger_tx_events ORDER BY ingested_at DESC LIMIT 5 FORMAT PrettyCompact"
+```
+
+You should see `source = clickhouse_kafka` for rows ingested by the native Kafka engine.
+
+## Verify MySQL projection
+
+```bash
 docker exec -i ledger-mysql mysql -uroot -proot ledger_db -e \
   "SELECT * FROM ledger_account_projection WHERE account_id='acc-001'\G"
 ```
 
-## Four pillars mapped to code
+## Four pillars (code)
 
-### Partition & ordering
+1. **Partitioning** — `message.key.columns` in `debezium-mysql-ledger.json`
+2. **Idempotent consumption** — `LedgerProjectionApplier` (`tx_id`)
+3. **Replay** — Kafka retention + new consumer group
+4. **Effective exactly-once (business layer)** — monotonic `event_seq` + manual Kafka ack
 
-- `kafka-connect/connectors/debezium-mysql-ledger.json`
-- `message.key.columns` = `ledger_db.ledger_transaction:account`
-  All changes for one account share one Kafka partition -> broker preserves order for that key.
+## ClickHouse init SQL changes
 
-### Idempotent consumption
+If you edit `clickhouse/init/*.sql`, existing volumes may not re-run scripts.  
+**Recreate** ClickHouse data:
 
-- `ledger-consumer-java/.../LedgerProjectionApplier.java` Deduplicate by `tx_id` in `ledger_consumer_processed` before
-  mutating the projection.
+```bash
+docker compose down
+docker volume rm ledger-cdc-kafka-demo_ledger_clickhouse_data 2>/dev/null || true
+# or remove the named volume shown by: docker volume ls | grep clickhouse
+docker compose up -d
+```
 
-### Replay
-
-- Kafka's `log.retention.hours` raised in compose for local exercise; production uses retention + archival.
-- Resets offsets or use a **new consumer group** to rebuild `ledger_account_projection` from the log (handlers must stay
-  replay-safe).
-
-### Effective exactly-once (business-layer)
-
-- same applier + **monotonic `event_seq`** guard (`last_event_seq < event_seq` on update); listener uses **manual ack**
-  only after the DB transaction succeeds (`application.yml`: `enable-auto-commit: false`, `ack-mode: manual_immediate`.
-
-Core consumer entrypoint: `ledger-consumer-java/.../cdc/LedgerDebeziumListener.java`
-
-## Operational notes
-
-- Run **one active Debezium connector** per captured table set in production, or split by bounded context.
-- Add **DLQ / retry caps** for poison messages; this demo retries by not committing the offset on failure.
-- For very high volume, scale consumer instance up to the **topic partition count** and keep **partition key =
-  account_id**. 
+(Exact volume name may differ; use `docker volume ls` to find it.)
